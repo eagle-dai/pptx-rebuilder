@@ -32,16 +32,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 全局初始化 EasyOCR Reader，避免每次请求重复加载模型
-# 首次运行会自动下载模型到本地 (约 10-20MB)
+# 全局初始化 EasyOCR Reader
 print("正在加载 EasyOCR 模型 (中英文)...")
 ocr_reader = easyocr.Reader(["en", "ch_sim"])
 print("EasyOCR 模型加载完成！")
 
 
 def fix_json_quotes(json_str: str) -> str:
-    json_str = json_str.replace(""", "'").replace(""", "'")
-    json_str = json_str.replace('"', '"').replace('"', '"')
+    json_str = json_str.replace("“", '"').replace("”", '"')
+    json_str = json_str.replace("‘", "'").replace("’", "'")
     result = []
     in_string = False
     i = 0
@@ -120,20 +119,15 @@ def extract_slide_images_from_pptx(
 
 
 def perform_ocr(image_bytes: bytes) -> list[dict]:
-    """
-    使用 EasyOCR 提取图像中的文本行及其精确坐标。
-    """
     img = Image.open(io.BytesIO(image_bytes))
     w, h = img.size
 
-    # EasyOCR 直接处理字节流
-    results = ocr_reader.readtext(image_bytes)
+    # 放宽合并策略，让 EasyOCR 尝试合并相近的段落
+    results = ocr_reader.readtext(image_bytes, paragraph=False)
 
     ocr_data = []
     for bbox, text, prob in results:
-        # 过滤低置信度和空白内容
         if prob > 0.3 and text.strip():
-            # bbox 是四个角点的坐标 [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
             x_coords = [p[0] for p in bbox]
             y_coords = [p[1] for p in bbox]
 
@@ -142,7 +136,6 @@ def perform_ocr(image_bytes: bytes) -> list[dict]:
             top = min(y_coords)
             bottom = max(y_coords)
 
-            # 转换为百分比坐标，方便后续 LLM 处理
             ocr_data.append(
                 {
                     "text": text,
@@ -231,26 +224,21 @@ def create_slide_from_analysis(prs: Presentation, analysis: dict):
 
 
 def _parse_position(value, reference_size) -> int:
-    """极其强壮的位置解析器，专治各种 LLM 幻觉"""
     if isinstance(value, (int, float)):
         return int(value)
     if isinstance(value, str):
         value = value.strip()
-        # 处理正常或异常的百分比 (例如 "50%", "50%50%", "50")
         if "%" in value:
             match = re.search(r"(\d+(?:\.\d+)?)", value)
             if match:
                 return int(reference_size * (float(match.group(1)) / 100))
-        # 处理带有 px 或是疯狂重复的字符串 (例如 "32px32px32px")
         match = re.search(r"(\d+(?:\.\d+)?)", value)
         if match:
-            # 提取第一个数字，按近似像素转换为 PPT 内部的 EMU 单位
             return int(float(match.group(1)) * 914400 / 96)
     return 0
 
 
 def _parse_safe_number(value, default=14) -> int:
-    """极其强壮的数字提取器（用于字号等）"""
     if isinstance(value, (int, float)):
         return int(value)
     if isinstance(value, str):
@@ -263,7 +251,6 @@ def _parse_safe_number(value, default=14) -> int:
 def _add_text_element(
     slide, element: dict, left: int, top: int, width: int, height: int
 ):
-    """添加文本元素，带有字号容错处理"""
     content = element.get("content", "")
     if not content:
         return
@@ -276,12 +263,12 @@ def _add_text_element(
         para = text_frame.paragraphs[0] if i == 0 else text_frame.add_paragraph()
         para.text = line
 
-        # 使用安全的数字提取器防止字号崩溃
         safe_font_size = _parse_safe_number(element.get("font_size", 14), default=14)
         para.font.size = Pt(safe_font_size)
-
         para.font.name = element.get("font_name", "Microsoft YaHei")
-        if element.get("bold"):
+
+        # 处理加粗标识
+        if element.get("bold") is True:
             para.font.bold = True
 
         color = element.get("color")
@@ -350,35 +337,39 @@ def _add_table_element(
     slide, element: dict, left: int, top: int, width: int, height: int
 ):
     rows_data = element.get("rows", [])
-    if not rows_data:
+    if not rows_data or not isinstance(rows_data, list):
         return
-    num_rows, num_cols = (
-        len(rows_data),
-        max(len(r) for r in rows_data) if rows_data else 1,
-    )
+
+    # 防止空行崩溃
+    valid_rows = [row for row in rows_data if isinstance(row, list) and len(row) > 0]
+    if not valid_rows:
+        return
+
+    num_rows = len(valid_rows)
+    num_cols = max(len(r) for r in valid_rows)
     table = slide.shapes.add_table(num_rows, num_cols, left, top, width, height).table
 
-    for r_idx, row in enumerate(rows_data):
+    for r_idx, row in enumerate(valid_rows):
         for c_idx, cell_text in enumerate(row):
             if c_idx < num_cols:
                 cell = table.cell(r_idx, c_idx)
-                cell.text = str(cell_text)
+                cell.text = str(cell_text) if cell_text else ""
                 cell.text_frame.word_wrap = True
                 para = cell.text_frame.paragraphs[0]
                 para.font.size = Pt(12)
                 para.font.name = "Microsoft YaHei"
+
+                # 设置表头加粗
+                if r_idx == 0 and element.get("has_header", True):
+                    para.font.bold = True
+                # 全局表格字体颜色
                 if element.get("color"):
                     p_c = parse_color(element.get("color"))
                     if p_c:
                         para.font.color.rgb = p_c
-                if r_idx == 0 and element.get("has_header", True):
-                    para.font.bold = True
 
 
 def analyze_slide_image_with_ocr(llm, image_base64: str, ocr_data: list) -> dict:
-    """
-    将原生 OCR 数据和原图一起发给 Claude，让其作为“清洗与合并引擎”。
-    """
     ocr_json_str = json.dumps(ocr_data, ensure_ascii=False)
 
     message = HumanMessage(
@@ -393,22 +384,55 @@ def analyze_slide_image_with_ocr(llm, image_base64: str, ocr_data: list) -> dict
             },
             {
                 "type": "text",
-                "text": f"""你是一个高级版面重构算法。我已经通过专业的 OCR 引擎提取了这张图片的精确物理坐标和文字，数据如下：
+                "text": f"""你是一个顶尖的文档版面重构专家（Document Layout Analyst）。我已经通过专业的 OCR 引擎提取了这张图片的物理坐标和文字，数据如下：
 <ocr_raw_data>
 {ocr_json_str}
 </ocr_raw_data>
 
-你的任务是：基于上面的 OCR 坐标数据和提供的原图，进行【语义清洗与元素聚合】。
+请基于上面的 OCR 坐标数据和提供的原图，进行【深度语义清洗与元素聚合】。
 
-【极其严格的规则】：
-1. **聚合重组**：OCR 数据是逐行扫描的，非常零碎。你必须观察原图，如果某几行 OCR 数据在视觉上同属于一个卡片、一个段落或一个表格单元格，你【必须】将它们合并为一个 `type: "text"` 元素（使用 `\\n` 换行）。
-2. **继承坐标**：合并后的文本块的 `left/top/width/height`，必须基于组成它的 OCR 子块的坐标域进行外推包含（涵盖它们的极值边界）。绝不准自己瞎编坐标！
-3. **表格构建**：如果 OCR 数据在视觉上呈现网格排列，你必须生成 `type: "table"`，把对应的 OCR 文字填入 `rows`，并计算整个表格的边界坐标。
-4. **补充色彩和背景**：OCR 引擎没有颜色信息。你需要看原图，为合并后的文本补充 `"color"` 字段，并根据需要为它们底层垫上 `"shape"` 背景块（z_order: 0）。
-5. **复杂图形占位**：对 OCR 无法提取的复杂架构图、流程图区域，生成 `image_placeholder`。
+【绝对禁令与严格规则】：
+1. **彻底消灭占位符**：绝对不允许在表格或文本中使用 "cells", "text here" 等无意义的占位符！所有内容必须 100% 来源于 OCR 原文提取。
+2. **强制语义聚合**：原图中的标题、长段落或形状内部的文字，在 OCR 中通常是断行的。你【必须】将视觉上同属一个区块（例如同一个箭头、同一个文本框）的碎片化 OCR 文本合并为一个 `type: "text"` 元素，使用 `\\n` 换行。
+3. **精准表格构建**：若画面存在表格网格结构，必须使用 `type: "table"`。`rows` 必须是一个严格的二维数组，将对应的 OCR 文本完美填入每一个单元格中。如果单元格包含多行文字，也必须完整保留。
+4. **字体层级识别**：根据原图中文字的大小与粗细，主动为 `type: "text"` 补充 `"font_size"` (例如大标题用 32 或更大，正文用 14) 和 `"bold"` (布尔值) 属性。
 
-【输出要求】：
-仅返回包含 `elements` 数组的纯 JSON。不需要解释。""",
+【必须遵循的 JSON 输出 Schema 示例】：
+```json
+{{
+  "background_color": "#FFFFFF",
+  "elements": [
+    {{
+      "type": "text",
+      "content": "大标题合并\\n第二行副标题",
+      "left": "5%", "top": "5%", "width": "50%", "height": "10%",
+      "font_size": 36, "bold": true, "color": "#0B2D71", "align": "left", "z_order": 10
+    }},
+    {{
+      "type": "shape",
+      "shape_type": "rectangle",
+      "fill_color": "#0070F2",
+      "left": "70%", "top": "40%", "width": "25%", "height": "20%", "z_order": 1
+    }},
+    {{
+      "type": "table",
+      "has_header": true,
+      "rows": [
+        ["Layer A Latency", "Edge Solution"],
+        ["User needs immediate...", "End-device Engine triggers..."]
+      ],
+      "left": "5%", "top": "25%", "width": "60%", "height": "40%", "z_order": 5
+    }},
+    {{
+      "type": "image_placeholder",
+      "description": "复杂的系统架构拓扑图",
+      "left": "25%", "top": "15%", "width": "50%", "height": "40%", "z_order": 5
+    }}
+  ]
+}}
+```
+
+要求：只返回纯 JSON，严禁输出任何分析过程或 Markdown 之外的文本。""",
             },
         ]
     )
@@ -435,12 +459,12 @@ def analyze_slide_image_with_ocr(llm, image_base64: str, ocr_data: list) -> dict
         return json.loads(response_text)
 
     except Exception as e:
-        print(f"JSON 解析失败: {e}")
+        print(f"JSON 解析失败: {e}\n模型原文: {response.content}")
         return {
             "elements": [
                 {
                     "type": "text",
-                    "content": "大模型处理 OCR 数据失败",
+                    "content": "大模型处理 OCR 数据失败，请检查终端日志。",
                     "left": "10%",
                     "top": "10%",
                     "width": "80%",
@@ -464,19 +488,17 @@ async def convert_pptx(file: UploadFile = File(...)):
 
         llm = get_llm()
         target_presentation = Presentation()
+        # 兼容目前常见的 16:9 宽屏比例
         target_presentation.slide_width = Inches(13.333)
         target_presentation.slide_height = Inches(7.5)
 
         for slide_idx, image_base64, image_raw_bytes in slide_images:
-            # 1. 使用 EasyOCR 进行像素级坐标与文字提取
             print(f"正在对第 {slide_idx + 1} 页进行 OCR 物理扫描...")
             ocr_data = perform_ocr(image_raw_bytes)
 
-            # 2. 交给 Claude 进行语义组合与颜色提取
             print(f"正在交给 LLM 进行语义排版清洗...")
             analysis = analyze_slide_image_with_ocr(llm, image_base64, ocr_data)
 
-            # 3. 渲染
             create_slide_from_analysis(target_presentation, analysis)
 
         output = io.BytesIO()
@@ -491,11 +513,6 @@ async def convert_pptx(file: UploadFile = File(...)):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"转换失败: {str(e)}")
-
-
-@app.get("/api/health")
-def health_check():
-    return {"status": "ok", "message": "Backend is running with EasyOCR Architecture."}
 
 
 if __name__ == "__main__":
