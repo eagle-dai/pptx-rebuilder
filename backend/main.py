@@ -126,25 +126,17 @@ def extract_slide_images_from_pptx(pptx_bytes: io.BytesIO) -> list[tuple[int, st
 def parse_color(color_str: str) -> Optional[RGBColor]:
     if not color_str:
         return None
-
     color_str = color_str.strip().lower()
 
-    color_names = {
-        "white": RGBColor(255, 255, 255),
-        "black": RGBColor(0, 0, 0),
-        "red": RGBColor(255, 0, 0),
-        "green": RGBColor(0, 128, 0),
-        "blue": RGBColor(0, 0, 255),
-        "yellow": RGBColor(255, 255, 0),
-        "orange": RGBColor(255, 165, 0),
-        "gray": RGBColor(128, 128, 128),
-        "grey": RGBColor(128, 128, 128),
-        "navy": RGBColor(0, 0, 128),
-        "purple": RGBColor(128, 0, 128),
-    }
-
-    if color_str in color_names:
-        return color_names[color_str]
+    # 增加对常见颜色的硬编码容错
+    if color_str in ["blue", "sap blue"]:
+        return RGBColor(0, 112, 242)  # SAP Logo Blue
+    if color_str in ["black"]:
+        return RGBColor(0, 0, 0)
+    if color_str in ["white"]:
+        return RGBColor(255, 255, 255)
+    if color_str in ["gray", "grey"]:
+        return RGBColor(128, 128, 128)
 
     if color_str.startswith("#"):
         hex_color = color_str[1:]
@@ -158,7 +150,6 @@ def parse_color(color_str: str) -> Optional[RGBColor]:
                 return RGBColor(r, g, b)
             except ValueError:
                 pass
-
     return None
 
 
@@ -169,7 +160,6 @@ def create_slide_from_analysis(prs: Presentation, analysis: dict, slide_idx: int
         blank_layout = prs.slide_layouts[-1]
 
     slide = prs.slides.add_slide(blank_layout)
-
     slide_width = prs.slide_width
     slide_height = prs.slide_height
 
@@ -183,7 +173,6 @@ def create_slide_from_analysis(prs: Presentation, analysis: dict, slide_idx: int
             fill.fore_color.rgb = parsed_color
 
     elements = analysis.get("elements", [])
-    # 严格根据 z_order 排序，确保背景形状（如卡片）在底层，文字在上层
     elements.sort(key=lambda x: x.get("z_order", 10))
 
     for element in elements:
@@ -224,8 +213,6 @@ def _add_text_element(
 
     textbox = slide.shapes.add_textbox(left, top, width, height)
     text_frame = textbox.text_frame
-
-    # 开启自适应，防止溢出
     text_frame.word_wrap = True
     text_frame.auto_size = MSO_AUTO_SIZE.SHAPE_TO_FIT_TEXT
 
@@ -237,8 +224,7 @@ def _add_text_element(
             para = text_frame.add_paragraph()
 
         para.text = line
-
-        font_size = element.get("font_size", 16)
+        font_size = element.get("font_size", 14)
         para.font.size = Pt(font_size)
         para.font.name = element.get("font_name", "Microsoft YaHei")
 
@@ -251,34 +237,22 @@ def _add_text_element(
             if parsed_color:
                 para.font.color.rgb = parsed_color
 
-        align = element.get("align", "left")
-        if align == "center":
-            para.alignment = PP_ALIGN.CENTER
-        elif align == "right":
-            para.alignment = PP_ALIGN.RIGHT
-        else:
-            para.alignment = PP_ALIGN.LEFT
-
 
 def _add_image_placeholder(
     slide, element: dict, left: int, top: int, width: int, height: int
 ):
-    desc = element.get("description", "图片插图")
-
+    desc = element.get("description", "图表/插图区")
     shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
-
     shape.fill.solid()
-    shape.fill.fore_color.rgb = RGBColor(230, 235, 240)  # 稍微带点蓝灰色的高级占位符
+    shape.fill.fore_color.rgb = RGBColor(230, 235, 240)
     shape.line.fill.background()
-
     text_frame = shape.text_frame
     text_frame.word_wrap = True
     para = text_frame.paragraphs[0]
-    para.text = f"[插图]\n{desc}"
+    para.text = f"[占位]\n{desc}"
     para.alignment = PP_ALIGN.CENTER
     para.font.size = Pt(12)
     para.font.color.rgb = RGBColor(120, 130, 140)
-    para.font.name = "Microsoft YaHei"
 
 
 def _add_shape_element(
@@ -288,9 +262,7 @@ def _add_shape_element(
     shape_map = {
         "rectangle": MSO_SHAPE.RECTANGLE,
         "rounded_rectangle": MSO_SHAPE.ROUNDED_RECTANGLE,
-        "oval": MSO_SHAPE.OVAL,
     }
-
     mso_shape = shape_map.get(shape_type, MSO_SHAPE.RECTANGLE)
     shape = slide.shapes.add_shape(mso_shape, left, top, width, height)
 
@@ -301,18 +273,9 @@ def _add_shape_element(
             shape.fill.solid()
             shape.fill.fore_color.rgb = parsed_color
         else:
-            shape.fill.background()  # 透明填充
+            shape.fill.background()
     else:
         shape.fill.background()
-
-    # 处理边框
-    border_color = element.get("border_color")
-    if border_color:
-        parsed_border = parse_color(border_color)
-        if parsed_border:
-            shape.line.color.rgb = parsed_border
-    else:
-        shape.line.fill.background()  # 无边框
 
 
 def _add_table_element(
@@ -321,10 +284,8 @@ def _add_table_element(
     rows_data = element.get("rows", [])
     if not rows_data:
         return
-
     num_rows = len(rows_data)
     num_cols = max(len(row) for row in rows_data) if rows_data else 1
-
     table = slide.shapes.add_table(num_rows, num_cols, left, top, width, height).table
 
     for row_idx, row_data in enumerate(rows_data):
@@ -332,16 +293,10 @@ def _add_table_element(
             if col_idx < num_cols:
                 cell = table.cell(row_idx, col_idx)
                 cell.text = str(cell_text)
-
                 text_frame = cell.text_frame
                 text_frame.word_wrap = True
-
                 para = cell.text_frame.paragraphs[0]
                 para.font.size = Pt(12)
-                para.font.name = "Microsoft YaHei"
-
-                if row_idx == 0 and element.get("has_header", True):
-                    para.font.bold = True
 
 
 def analyze_slide_image(llm, image_base64: str, slide_index: int) -> dict:
@@ -357,60 +312,41 @@ def analyze_slide_image(llm, image_base64: str, slide_index: int) -> dict:
             },
             {
                 "type": "text",
-                "text": """你是一个专业的 PPT 页面重构引擎。你的任务是将这张图片格式的幻灯片，精准地逆向还原为结构化的排版 JSON，以便作为通用工具重绘出可编辑的 PPT。
+                "text": """你是一个极其专业的 PPT 页面重构引擎。你的任务是将这张幻灯片精准逆向为 JSON 排版数据。
 
-【核心排版还原规则】（极其重要）：
-1. **精准定位**：评估每个视觉块在画面中的 left, top, width, height（使用百分比）。尽可能还原原图的视觉分布，保留留白。
-2. **文本分离原则**：
-   - 如果是视觉上明显分离的文本块（例如：左右两列的对比、位于不同卡片内的文字、散落在图表周围的标注），**必须拆分为不同的 type: "text" 元素**，各自独立定位。
-   - 只有属于同一个逻辑段落，或者同一个紧凑列表（如带有 bullet points 的多行）时，才合并在一个文本元素中，使用 \\n 换行。
-3. **几何与卡片还原**：画面中的背景色块、卡片背景、简单的几何框选（如矩形、圆角矩形），请使用 type: "shape" 还原，并提取近似的 fill_color 或 border_color。务必将 shape 的 z_order 设置为较小的值（如 0 或 1），以便垫在文字下方。
-4. **表格识别**：如果画面中有明显的行列网格、数据对比矩阵，请使用 type: "table" 进行结构化提取。
-5. **复杂图像兜底**：仅针对真实照片、极其复杂的拓扑图、带有不规则人物/连线的插画等**完全无法用基础 PPT 形状拼接**的区域，使用 type: "image_placeholder"。
+【🚨 致命错误警告与强制规范】
+1. **强制提取字体颜色（极其重要）**：你必须提取所有文本的颜色并输出 "color" 字段。如果标题是深蓝色（如 SAP Blue），必须输出 "#0070F2"；如果是深灰色正文，输出 "#333333"；如果是浅灰色说明，输出 "#666666"。绝不允许漏掉颜色属性！
+2. **彻底消灭文本碎片（极其重要）**：如果几行文字属于同一个 UI 卡片（比如包含一个黑体标题、一段灰字描述、一个底部链接），你【绝对必须】将它们合并成一个单独的 type: "text" 元素，并使用 \\n 换行！绝不允许把卡片拆散成 3 个文本框！
+3. **强制表格输出（极其重要）**：如果画面中出现任何带有行、列结构的网格（哪怕没有明显的边框，只要是对齐的矩阵），你【必须】使用 type: "table"。哪怕有些单元格合并了，你也要用空字符串 "" 补齐二维数组（rows），绝对不允许把表格降级为零散的文本元素！
+4. **底层背景卡片**：如果内容被包裹在带背景色的卡片内，使用 type: "shape" 建立背景卡片，并将其 z_order 设为 0。文字的 z_order 设为 10。
 
-返回 JSON 格式范例：
+返回 JSON 格式要求范例：
 {
-  "background_color": "#FFFFFF",
   "elements": [
     {
       "type": "shape",
       "shape_type": "rounded_rectangle",
-      "left": "5%", "top": "20%", "width": "40%", "height": "60%",
+      "left": "5%", "top": "20%", "width": "20%", "height": "30%",
       "fill_color": "#F3F6F9",
-      "border_color": "#D1D5DB",
       "z_order": 0
     },
     {
       "type": "text",
-      "content": "卡片标题",
-      "left": "8%", "top": "22%", "width": "34%", "height": "10%",
-      "font_size": 20, "bold": true, "color": "#000000", "align": "left",
-      "z_order": 1
-    },
-    {
-      "type": "text",
-      "content": "这是一段位于左侧卡片内的正文描述。\\n• 要点一\\n• 要点二",
-      "left": "8%", "top": "35%", "width": "34%", "height": "40%",
-      "font_size": 14, "bold": false, "color": "#333333", "align": "left",
-      "z_order": 1
-    },
-    {
-      "type": "image_placeholder",
-      "description": "复杂的神经元网络连接图",
-      "left": "50%", "top": "20%", "width": "45%", "height": "60%",
-      "z_order": 1
+      "content": "Object Detection\\nDetect and identify objects in images.\\nLearn more →",
+      "left": "6%", "top": "22%", "width": "18%", "height": "25%",
+      "color": "#333333",
+      "z_order": 10
     },
     {
       "type": "table",
-      "rows": [["参数名", "数值"], ["延迟", "0.4s"]],
-      "has_header": true,
-      "left": "10%", "top": "85%", "width": "80%", "height": "10%",
-      "z_order": 1
+      "rows": [["Category", "Latency (The Silence Gap)"], ["The Goal", "User needs immediate 0-0.4s acknowledgement."]],
+      "left": "10%", "top": "50%", "width": "80%", "height": "40%",
+      "z_order": 10
     }
   ]
 }
 
-请只返回纯 JSON 内容，不要包含 markdown 代码块或其他解释性文字。""",
+请只返回纯 JSON 内容，确保结构完整。""",
             },
         ]
     )
@@ -419,50 +355,37 @@ def analyze_slide_image(llm, image_base64: str, slide_index: int) -> dict:
 
     try:
         response_text = response.content.strip()
-
         code_block_match = re.search(
             r"```(?:json)?\s*\n?(.*?)\n?```", response_text, re.DOTALL
         )
         if code_block_match:
             response_text = code_block_match.group(1).strip()
-
         if response_text.startswith("```"):
             lines = response_text.split("\n")
-            start_idx = 1
-            end_idx = len(lines)
-            for i, line in enumerate(lines):
-                if i > 0 and line.strip() == "```":
-                    end_idx = i
-                    break
-            response_text = "\n".join(lines[start_idx:end_idx]).strip()
+            response_text = "\n".join(lines[1:-1]).strip()
 
         json_start = response_text.find("{")
         json_end = response_text.rfind("}")
-        if json_start != -1 and json_end != -1 and json_end > json_start:
+        if json_start != -1 and json_end != -1:
             response_text = response_text[json_start : json_end + 1]
 
         response_text = fix_json_quotes(response_text)
         result = json.loads(response_text)
-
-        if not isinstance(result, dict):
-            raise ValueError("返回结果不是字典类型")
-
         return result
 
-    except (json.JSONDecodeError, AttributeError, ValueError) as e:
+    except Exception as e:
         print(f"JSON 解析失败: {e}")
         return {
-            "background_color": "#FFFFFF",
             "elements": [
                 {
                     "type": "text",
-                    "content": "解析幻灯片失败，请查看后端日志。",
+                    "content": "解析失败",
                     "left": "10%",
                     "top": "10%",
                     "width": "80%",
                     "height": "10%",
                 }
-            ],
+            ]
         }
 
 
@@ -470,11 +393,9 @@ def analyze_slide_image(llm, image_base64: str, slide_index: int) -> dict:
 async def convert_pptx(file: UploadFile = File(...)):
     if not file.filename.endswith(".pptx"):
         raise HTTPException(status_code=400, detail="仅支持 .pptx 文件上传")
-
     try:
         content = await file.read()
         source_pptx = io.BytesIO(content)
-
         slide_images = extract_slide_images_from_pptx(source_pptx)
 
         if not slide_images:
@@ -492,7 +413,6 @@ async def convert_pptx(file: UploadFile = File(...)):
         output = io.BytesIO()
         target_presentation.save(output)
         output.seek(0)
-
         return StreamingResponse(
             output,
             media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -500,9 +420,6 @@ async def convert_pptx(file: UploadFile = File(...)):
                 "Content-Disposition": f"attachment; filename=rebuilt_{file.filename}"
             },
         )
-
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"转换失败: {str(e)}")
 
