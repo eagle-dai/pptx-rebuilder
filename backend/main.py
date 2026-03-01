@@ -183,7 +183,8 @@ def create_slide_from_analysis(prs: Presentation, analysis: dict, slide_idx: int
             fill.fore_color.rgb = parsed_color
 
     elements = analysis.get("elements", [])
-    elements.sort(key=lambda x: x.get("z_order", 0))
+    # 严格根据 z_order 排序，确保背景形状（如卡片）在底层，文字在上层
+    elements.sort(key=lambda x: x.get("z_order", 10))
 
     for element in elements:
         elem_type = element.get("type", "text")
@@ -191,8 +192,6 @@ def create_slide_from_analysis(prs: Presentation, analysis: dict, slide_idx: int
         left = _parse_position(element.get("left", 0), slide_width)
         top = _parse_position(element.get("top", 0), slide_height)
         width = _parse_position(element.get("width", 100), slide_width)
-
-        # 抛弃高度硬编码，让元素自适应
         height = _parse_position(element.get("height", 10), slide_height)
 
         if elem_type == "text":
@@ -226,7 +225,7 @@ def _add_text_element(
     textbox = slide.shapes.add_textbox(left, top, width, height)
     text_frame = textbox.text_frame
 
-    # 核心修复：允许文字自动换行，并且强制框体向下延展以包裹文字，防止挤压或裁切
+    # 开启自适应，防止溢出
     text_frame.word_wrap = True
     text_frame.auto_size = MSO_AUTO_SIZE.SHAPE_TO_FIT_TEXT
 
@@ -264,25 +263,21 @@ def _add_text_element(
 def _add_image_placeholder(
     slide, element: dict, left: int, top: int, width: int, height: int
 ):
-    """生成一个优雅的灰色占位框，替代混乱的图片裁剪。"""
     desc = element.get("description", "图片插图")
 
-    # 画一个矩形
     shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
 
-    # 设置为浅灰色背景，无边框
     shape.fill.solid()
-    shape.fill.fore_color.rgb = RGBColor(240, 240, 240)
+    shape.fill.fore_color.rgb = RGBColor(230, 235, 240)  # 稍微带点蓝灰色的高级占位符
     shape.line.fill.background()
 
-    # 填入说明文字
     text_frame = shape.text_frame
     text_frame.word_wrap = True
     para = text_frame.paragraphs[0]
-    para.text = f"[插图占位]\n{desc}"
+    para.text = f"[插图]\n{desc}"
     para.alignment = PP_ALIGN.CENTER
-    para.font.size = Pt(14)
-    para.font.color.rgb = RGBColor(150, 150, 150)
+    para.font.size = Pt(12)
+    para.font.color.rgb = RGBColor(120, 130, 140)
     para.font.name = "Microsoft YaHei"
 
 
@@ -305,10 +300,19 @@ def _add_shape_element(
         if parsed_color:
             shape.fill.solid()
             shape.fill.fore_color.rgb = parsed_color
+        else:
+            shape.fill.background()  # 透明填充
+    else:
+        shape.fill.background()
 
-    text = element.get("text")
-    if text:
-        shape.text = text
+    # 处理边框
+    border_color = element.get("border_color")
+    if border_color:
+        parsed_border = parse_color(border_color)
+        if parsed_border:
+            shape.line.color.rgb = parsed_border
+    else:
+        shape.line.fill.background()  # 无边框
 
 
 def _add_table_element(
@@ -353,40 +357,55 @@ def analyze_slide_image(llm, image_base64: str, slide_index: int) -> dict:
             },
             {
                 "type": "text",
-                "text": """请深度解析这张幻灯片图片，将视觉内容转换为结构化的排版 JSON。
+                "text": """你是一个专业的 PPT 页面重构引擎。你的任务是将这张图片格式的幻灯片，精准地逆向还原为结构化的排版 JSON，以便作为通用工具重绘出可编辑的 PPT。
 
-核心策略与要求（极其重要）：
-1. 你的首要目标是提取文本逻辑，而不是试图做像素级的复刻。
-2. 【合并文本块】：请不要把每一行字都拆成独立的 element！属于同一逻辑块的文字（比如一个标题下的多个子要点），请合并为一个 type: "text" 元素，内容中使用换行符 \\n 分隔。这样能极大保证 PPT 生成后的整洁度。
-3. 【废弃图像裁剪】：多模态模型无法给出精确像素坐标，以前的裁剪尝试会导致碎片。现在，遇到任何复杂的图表、人物照片、架构图等，请统一使用 type: "image_placeholder"。
-4. 【忽略无意义装饰】：对于页面背景的杂乱线条、孤立的小图标（比如喇叭、麦克风），如果不承载核心文字内容，请直接忽略！不要为它们建立 element，以保持版面干净。
+【核心排版还原规则】（极其重要）：
+1. **精准定位**：评估每个视觉块在画面中的 left, top, width, height（使用百分比）。尽可能还原原图的视觉分布，保留留白。
+2. **文本分离原则**：
+   - 如果是视觉上明显分离的文本块（例如：左右两列的对比、位于不同卡片内的文字、散落在图表周围的标注），**必须拆分为不同的 type: "text" 元素**，各自独立定位。
+   - 只有属于同一个逻辑段落，或者同一个紧凑列表（如带有 bullet points 的多行）时，才合并在一个文本元素中，使用 \\n 换行。
+3. **几何与卡片还原**：画面中的背景色块、卡片背景、简单的几何框选（如矩形、圆角矩形），请使用 type: "shape" 还原，并提取近似的 fill_color 或 border_color。务必将 shape 的 z_order 设置为较小的值（如 0 或 1），以便垫在文字下方。
+4. **表格识别**：如果画面中有明显的行列网格、数据对比矩阵，请使用 type: "table" 进行结构化提取。
+5. **复杂图像兜底**：仅针对真实照片、极其复杂的拓扑图、带有不规则人物/连线的插画等**完全无法用基础 PPT 形状拼接**的区域，使用 type: "image_placeholder"。
 
-返回 JSON 格式要求：
+返回 JSON 格式范例：
 {
   "background_color": "#FFFFFF",
   "elements": [
     {
-      "type": "text",
-      "content": "大标题内容",
-      "left": "5%", "top": "5%", "width": "90%", "height": "10%",
-      "font_size": 32, "bold": true, "color": "#000000", "align": "left"
+      "type": "shape",
+      "shape_type": "rounded_rectangle",
+      "left": "5%", "top": "20%", "width": "40%", "height": "60%",
+      "fill_color": "#F3F6F9",
+      "border_color": "#D1D5DB",
+      "z_order": 0
     },
     {
       "type": "text",
-      "content": "逻辑块标题\\n• 子要点一\\n• 子要点二",
-      "left": "5%", "top": "20%", "width": "40%", "height": "30%",
-      "font_size": 18, "bold": false, "color": "#333333", "align": "left"
+      "content": "卡片标题",
+      "left": "8%", "top": "22%", "width": "34%", "height": "10%",
+      "font_size": 20, "bold": true, "color": "#000000", "align": "left",
+      "z_order": 1
+    },
+    {
+      "type": "text",
+      "content": "这是一段位于左侧卡片内的正文描述。\\n• 要点一\\n• 要点二",
+      "left": "8%", "top": "35%", "width": "34%", "height": "40%",
+      "font_size": 14, "bold": false, "color": "#333333", "align": "left",
+      "z_order": 1
     },
     {
       "type": "image_placeholder",
-      "description": "说明这是一张什么图，例如：云边协同架构图 / 人物头像",
-      "left": "50%", "top": "20%", "width": "45%", "height": "60%"
+      "description": "复杂的神经元网络连接图",
+      "left": "50%", "top": "20%", "width": "45%", "height": "60%",
+      "z_order": 1
     },
     {
       "type": "table",
-      "rows": [["表头1", "表头2"], ["数据1", "数据2"]],
+      "rows": [["参数名", "数值"], ["延迟", "0.4s"]],
       "has_header": true,
-      "left": "5%", "top": "60%", "width": "90%", "height": "30%"
+      "left": "10%", "top": "85%", "width": "80%", "height": "10%",
+      "z_order": 1
     }
   ]
 }
