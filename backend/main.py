@@ -16,10 +16,13 @@ from pptx.enum.shapes import MSO_SHAPE
 from langchain_core.messages import HumanMessage
 from PIL import Image
 
-# SAP Cloud SDK for AI - 使用 LangChain 集成
+# 引入强大的 EasyOCR
+import easyocr
+
+# SAP Cloud SDK for AI
 from gen_ai_hub.proxy.langchain.init_models import init_llm
 
-app = FastAPI(title="PPTX Rebuilder API")
+app = FastAPI(title="PPTX Rebuilder API (EasyOCR + LLM)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,24 +32,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 全局初始化 EasyOCR Reader，避免每次请求重复加载模型
+# 首次运行会自动下载模型到本地 (约 10-20MB)
+print("正在加载 EasyOCR 模型 (中英文)...")
+ocr_reader = easyocr.Reader(["en", "ch_sim"])
+print("EasyOCR 模型加载完成！")
+
 
 def fix_json_quotes(json_str: str) -> str:
     json_str = json_str.replace(""", "'").replace(""", "'")
     json_str = json_str.replace('"', '"').replace('"', '"')
-
     result = []
     in_string = False
     i = 0
-
     while i < len(json_str):
         c = json_str[i]
-
         if c == "\\" and i + 1 < len(json_str):
             result.append(c)
             result.append(json_str[i + 1])
             i += 2
             continue
-
         if c == '"':
             if not in_string:
                 in_string = True
@@ -55,7 +60,6 @@ def fix_json_quotes(json_str: str) -> str:
                 j = i + 1
                 while j < len(json_str) and json_str[j] in " \t\n\r":
                     j += 1
-
                 if j >= len(json_str) or json_str[j] in ",}]:":
                     in_string = False
                     result.append(c)
@@ -63,9 +67,7 @@ def fix_json_quotes(json_str: str) -> str:
                     result.append("'")
         else:
             result.append(c)
-
         i += 1
-
     return "".join(result)
 
 
@@ -77,10 +79,11 @@ def get_llm():
     return llm
 
 
-def extract_slide_images_from_pptx(pptx_bytes: io.BytesIO) -> list[tuple[int, str]]:
+def extract_slide_images_from_pptx(
+    pptx_bytes: io.BytesIO,
+) -> list[tuple[int, str, bytes]]:
     images = []
     pptx_bytes.seek(0)
-
     with zipfile.ZipFile(pptx_bytes, "r") as zf:
         slide_files = sorted(
             [
@@ -94,16 +97,12 @@ def extract_slide_images_from_pptx(pptx_bytes: io.BytesIO) -> list[tuple[int, st
         for slide_idx, slide_file in enumerate(slide_files):
             slide_num = slide_file.replace("ppt/slides/slide", "").replace(".xml", "")
             rels_file = f"ppt/slides/_rels/slide{slide_num}.xml.rels"
-
             if rels_file not in zf.namelist():
                 continue
-
             rels_content = zf.read(rels_file).decode("utf-8")
             image_refs = re.findall(
                 r'Target="\.\./(media/image\d+\.[a-zA-Z]+)"', rels_content
             )
-
-            main_image_base64 = None
 
             if image_refs:
                 image_path = f"ppt/{image_refs[0]}"
@@ -116,11 +115,45 @@ def extract_slide_images_from_pptx(pptx_bytes: io.BytesIO) -> list[tuple[int, st
                     main_image_base64 = base64.b64encode(png_buffer.read()).decode(
                         "utf-8"
                     )
-
-            if main_image_base64:
-                images.append((slide_idx, main_image_base64))
-
+                    images.append((slide_idx, main_image_base64, image_data))
     return images
+
+
+def perform_ocr(image_bytes: bytes) -> list[dict]:
+    """
+    使用 EasyOCR 提取图像中的文本行及其精确坐标。
+    """
+    img = Image.open(io.BytesIO(image_bytes))
+    w, h = img.size
+
+    # EasyOCR 直接处理字节流
+    results = ocr_reader.readtext(image_bytes)
+
+    ocr_data = []
+    for bbox, text, prob in results:
+        # 过滤低置信度和空白内容
+        if prob > 0.3 and text.strip():
+            # bbox 是四个角点的坐标 [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+            x_coords = [p[0] for p in bbox]
+            y_coords = [p[1] for p in bbox]
+
+            left = min(x_coords)
+            right = max(x_coords)
+            top = min(y_coords)
+            bottom = max(y_coords)
+
+            # 转换为百分比坐标，方便后续 LLM 处理
+            ocr_data.append(
+                {
+                    "text": text,
+                    "left": f"{int(left / w * 100)}%",
+                    "top": f"{int(top / h * 100)}%",
+                    "width": f"{int((right - left) / w * 100)}%",
+                    "height": f"{int((bottom - top) / h * 100)}%",
+                }
+            )
+
+    return ocr_data
 
 
 def parse_color(color_str: str) -> Optional[RGBColor]:
@@ -128,15 +161,20 @@ def parse_color(color_str: str) -> Optional[RGBColor]:
         return None
     color_str = color_str.strip().lower()
 
-    # 增加对常见颜色的硬编码容错
-    if color_str in ["blue", "sap blue"]:
-        return RGBColor(0, 112, 242)  # SAP Logo Blue
-    if color_str in ["black"]:
-        return RGBColor(0, 0, 0)
-    if color_str in ["white"]:
-        return RGBColor(255, 255, 255)
-    if color_str in ["gray", "grey"]:
-        return RGBColor(128, 128, 128)
+    semantic_colors = {
+        "blue": RGBColor(0, 112, 242),
+        "sap blue": RGBColor(0, 112, 242),
+        "navy": RGBColor(10, 30, 80),
+        "black": RGBColor(0, 0, 0),
+        "white": RGBColor(255, 255, 255),
+        "gray": RGBColor(128, 128, 128),
+        "grey": RGBColor(128, 128, 128),
+        "light gray": RGBColor(240, 240, 240),
+        "red": RGBColor(230, 50, 50),
+        "green": RGBColor(40, 160, 60),
+    }
+    if color_str in semantic_colors:
+        return semantic_colors[color_str]
 
     if color_str.startswith("#"):
         hex_color = color_str[1:]
@@ -144,40 +182,38 @@ def parse_color(color_str: str) -> Optional[RGBColor]:
             hex_color = "".join([c * 2 for c in hex_color])
         if len(hex_color) == 6:
             try:
-                r = int(hex_color[0:2], 16)
-                g = int(hex_color[2:4], 16)
-                b = int(hex_color[4:6], 16)
-                return RGBColor(r, g, b)
+                return RGBColor(
+                    int(hex_color[0:2], 16),
+                    int(hex_color[2:4], 16),
+                    int(hex_color[4:6], 16),
+                )
             except ValueError:
                 pass
     return None
 
 
-def create_slide_from_analysis(prs: Presentation, analysis: dict, slide_idx: int):
+def create_slide_from_analysis(prs: Presentation, analysis: dict):
     try:
         blank_layout = prs.slide_layouts[6]
     except IndexError:
         blank_layout = prs.slide_layouts[-1]
-
     slide = prs.slides.add_slide(blank_layout)
-    slide_width = prs.slide_width
-    slide_height = prs.slide_height
+
+    slide_width, slide_height = prs.slide_width, prs.slide_height
 
     bg_color = analysis.get("background_color")
     if bg_color:
         parsed_color = parse_color(bg_color)
         if parsed_color:
             background = slide.background
-            fill = background.fill
-            fill.solid()
-            fill.fore_color.rgb = parsed_color
+            background.fill.solid()
+            background.fill.fore_color.rgb = parsed_color
 
     elements = analysis.get("elements", [])
     elements.sort(key=lambda x: x.get("z_order", 10))
 
     for element in elements:
         elem_type = element.get("type", "text")
-
         left = _parse_position(element.get("left", 0), slide_width)
         top = _parse_position(element.get("top", 0), slide_height)
         width = _parse_position(element.get("width", 100), slide_width)
@@ -191,91 +227,123 @@ def create_slide_from_analysis(prs: Presentation, analysis: dict, slide_idx: int
             _add_table_element(slide, element, left, top, width, height)
         elif elem_type == "shape":
             _add_shape_element(slide, element, left, top, width, height)
-
     return slide
 
 
 def _parse_position(value, reference_size) -> int:
+    """极其强壮的位置解析器，专治各种 LLM 幻觉"""
+    if isinstance(value, (int, float)):
+        return int(value)
     if isinstance(value, str):
         value = value.strip()
-        if value.endswith("%"):
-            pct = float(value[:-1]) / 100
-            return int(reference_size * pct)
-    return int(value) if value else 0
+        # 处理正常或异常的百分比 (例如 "50%", "50%50%", "50")
+        if "%" in value:
+            match = re.search(r"(\d+(?:\.\d+)?)", value)
+            if match:
+                return int(reference_size * (float(match.group(1)) / 100))
+        # 处理带有 px 或是疯狂重复的字符串 (例如 "32px32px32px")
+        match = re.search(r"(\d+(?:\.\d+)?)", value)
+        if match:
+            # 提取第一个数字，按近似像素转换为 PPT 内部的 EMU 单位
+            return int(float(match.group(1)) * 914400 / 96)
+    return 0
+
+
+def _parse_safe_number(value, default=14) -> int:
+    """极其强壮的数字提取器（用于字号等）"""
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        match = re.search(r"(\d+)", value)
+        if match:
+            return int(match.group(1))
+    return default
 
 
 def _add_text_element(
     slide, element: dict, left: int, top: int, width: int, height: int
 ):
+    """添加文本元素，带有字号容错处理"""
     content = element.get("content", "")
     if not content:
         return
-
     textbox = slide.shapes.add_textbox(left, top, width, height)
     text_frame = textbox.text_frame
     text_frame.word_wrap = True
     text_frame.auto_size = MSO_AUTO_SIZE.SHAPE_TO_FIT_TEXT
 
-    lines = content.split("\n")
-    for i, line in enumerate(lines):
-        if i == 0:
-            para = text_frame.paragraphs[0]
-        else:
-            para = text_frame.add_paragraph()
-
+    for i, line in enumerate(content.split("\n")):
+        para = text_frame.paragraphs[0] if i == 0 else text_frame.add_paragraph()
         para.text = line
-        font_size = element.get("font_size", 14)
-        para.font.size = Pt(font_size)
-        para.font.name = element.get("font_name", "Microsoft YaHei")
 
+        # 使用安全的数字提取器防止字号崩溃
+        safe_font_size = _parse_safe_number(element.get("font_size", 14), default=14)
+        para.font.size = Pt(safe_font_size)
+
+        para.font.name = element.get("font_name", "Microsoft YaHei")
         if element.get("bold"):
             para.font.bold = True
 
         color = element.get("color")
         if color:
-            parsed_color = parse_color(color)
-            if parsed_color:
-                para.font.color.rgb = parsed_color
+            parsed = parse_color(color)
+            if parsed:
+                para.font.color.rgb = parsed
+
+        align = element.get("align", "left")
+        if align == "center":
+            para.alignment = PP_ALIGN.CENTER
+        elif align == "right":
+            para.alignment = PP_ALIGN.RIGHT
+        else:
+            para.alignment = PP_ALIGN.LEFT
 
 
 def _add_image_placeholder(
     slide, element: dict, left: int, top: int, width: int, height: int
 ):
-    desc = element.get("description", "图表/插图区")
     shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
     shape.fill.solid()
-    shape.fill.fore_color.rgb = RGBColor(230, 235, 240)
-    shape.line.fill.background()
+    shape.fill.fore_color.rgb = RGBColor(240, 245, 250)
+    shape.line.color.rgb = RGBColor(200, 210, 220)
     text_frame = shape.text_frame
     text_frame.word_wrap = True
     para = text_frame.paragraphs[0]
-    para.text = f"[占位]\n{desc}"
+    para.text = f"[插图区]\n{element.get('description', '插图占位')}"
     para.alignment = PP_ALIGN.CENTER
     para.font.size = Pt(12)
     para.font.color.rgb = RGBColor(120, 130, 140)
+    para.font.name = "Microsoft YaHei"
 
 
 def _add_shape_element(
     slide, element: dict, left: int, top: int, width: int, height: int
 ):
-    shape_type = element.get("shape_type", "rectangle")
-    shape_map = {
-        "rectangle": MSO_SHAPE.RECTANGLE,
-        "rounded_rectangle": MSO_SHAPE.ROUNDED_RECTANGLE,
-    }
-    mso_shape = shape_map.get(shape_type, MSO_SHAPE.RECTANGLE)
+    mso_shape = (
+        MSO_SHAPE.ROUNDED_RECTANGLE
+        if element.get("shape_type") == "rounded_rectangle"
+        else MSO_SHAPE.RECTANGLE
+    )
     shape = slide.shapes.add_shape(mso_shape, left, top, width, height)
 
     fill_color = element.get("fill_color")
     if fill_color:
-        parsed_color = parse_color(fill_color)
-        if parsed_color:
+        parsed = parse_color(fill_color)
+        if parsed:
             shape.fill.solid()
-            shape.fill.fore_color.rgb = parsed_color
+            shape.fill.fore_color.rgb = parsed
         else:
             shape.fill.background()
     else:
         shape.fill.background()
+
+    border_color = element.get("border_color")
+    if border_color:
+        parsed_border = parse_color(border_color)
+        if parsed_border:
+            shape.line.color.rgb = parsed_border
+    else:
+        shape.line.fill.background()
 
 
 def _add_table_element(
@@ -284,22 +352,35 @@ def _add_table_element(
     rows_data = element.get("rows", [])
     if not rows_data:
         return
-    num_rows = len(rows_data)
-    num_cols = max(len(row) for row in rows_data) if rows_data else 1
+    num_rows, num_cols = (
+        len(rows_data),
+        max(len(r) for r in rows_data) if rows_data else 1,
+    )
     table = slide.shapes.add_table(num_rows, num_cols, left, top, width, height).table
 
-    for row_idx, row_data in enumerate(rows_data):
-        for col_idx, cell_text in enumerate(row_data):
-            if col_idx < num_cols:
-                cell = table.cell(row_idx, col_idx)
+    for r_idx, row in enumerate(rows_data):
+        for c_idx, cell_text in enumerate(row):
+            if c_idx < num_cols:
+                cell = table.cell(r_idx, c_idx)
                 cell.text = str(cell_text)
-                text_frame = cell.text_frame
-                text_frame.word_wrap = True
+                cell.text_frame.word_wrap = True
                 para = cell.text_frame.paragraphs[0]
                 para.font.size = Pt(12)
+                para.font.name = "Microsoft YaHei"
+                if element.get("color"):
+                    p_c = parse_color(element.get("color"))
+                    if p_c:
+                        para.font.color.rgb = p_c
+                if r_idx == 0 and element.get("has_header", True):
+                    para.font.bold = True
 
 
-def analyze_slide_image(llm, image_base64: str, slide_index: int) -> dict:
+def analyze_slide_image_with_ocr(llm, image_base64: str, ocr_data: list) -> dict:
+    """
+    将原生 OCR 数据和原图一起发给 Claude，让其作为“清洗与合并引擎”。
+    """
+    ocr_json_str = json.dumps(ocr_data, ensure_ascii=False)
+
     message = HumanMessage(
         content=[
             {
@@ -312,41 +393,22 @@ def analyze_slide_image(llm, image_base64: str, slide_index: int) -> dict:
             },
             {
                 "type": "text",
-                "text": """你是一个极其专业的 PPT 页面重构引擎。你的任务是将这张幻灯片精准逆向为 JSON 排版数据。
+                "text": f"""你是一个高级版面重构算法。我已经通过专业的 OCR 引擎提取了这张图片的精确物理坐标和文字，数据如下：
+<ocr_raw_data>
+{ocr_json_str}
+</ocr_raw_data>
 
-【🚨 致命错误警告与强制规范】
-1. **强制提取字体颜色（极其重要）**：你必须提取所有文本的颜色并输出 "color" 字段。如果标题是深蓝色（如 SAP Blue），必须输出 "#0070F2"；如果是深灰色正文，输出 "#333333"；如果是浅灰色说明，输出 "#666666"。绝不允许漏掉颜色属性！
-2. **彻底消灭文本碎片（极其重要）**：如果几行文字属于同一个 UI 卡片（比如包含一个黑体标题、一段灰字描述、一个底部链接），你【绝对必须】将它们合并成一个单独的 type: "text" 元素，并使用 \\n 换行！绝不允许把卡片拆散成 3 个文本框！
-3. **强制表格输出（极其重要）**：如果画面中出现任何带有行、列结构的网格（哪怕没有明显的边框，只要是对齐的矩阵），你【必须】使用 type: "table"。哪怕有些单元格合并了，你也要用空字符串 "" 补齐二维数组（rows），绝对不允许把表格降级为零散的文本元素！
-4. **底层背景卡片**：如果内容被包裹在带背景色的卡片内，使用 type: "shape" 建立背景卡片，并将其 z_order 设为 0。文字的 z_order 设为 10。
+你的任务是：基于上面的 OCR 坐标数据和提供的原图，进行【语义清洗与元素聚合】。
 
-返回 JSON 格式要求范例：
-{
-  "elements": [
-    {
-      "type": "shape",
-      "shape_type": "rounded_rectangle",
-      "left": "5%", "top": "20%", "width": "20%", "height": "30%",
-      "fill_color": "#F3F6F9",
-      "z_order": 0
-    },
-    {
-      "type": "text",
-      "content": "Object Detection\\nDetect and identify objects in images.\\nLearn more →",
-      "left": "6%", "top": "22%", "width": "18%", "height": "25%",
-      "color": "#333333",
-      "z_order": 10
-    },
-    {
-      "type": "table",
-      "rows": [["Category", "Latency (The Silence Gap)"], ["The Goal", "User needs immediate 0-0.4s acknowledgement."]],
-      "left": "10%", "top": "50%", "width": "80%", "height": "40%",
-      "z_order": 10
-    }
-  ]
-}
+【极其严格的规则】：
+1. **聚合重组**：OCR 数据是逐行扫描的，非常零碎。你必须观察原图，如果某几行 OCR 数据在视觉上同属于一个卡片、一个段落或一个表格单元格，你【必须】将它们合并为一个 `type: "text"` 元素（使用 `\\n` 换行）。
+2. **继承坐标**：合并后的文本块的 `left/top/width/height`，必须基于组成它的 OCR 子块的坐标域进行外推包含（涵盖它们的极值边界）。绝不准自己瞎编坐标！
+3. **表格构建**：如果 OCR 数据在视觉上呈现网格排列，你必须生成 `type: "table"`，把对应的 OCR 文字填入 `rows`，并计算整个表格的边界坐标。
+4. **补充色彩和背景**：OCR 引擎没有颜色信息。你需要看原图，为合并后的文本补充 `"color"` 字段，并根据需要为它们底层垫上 `"shape"` 背景块（z_order: 0）。
+5. **复杂图形占位**：对 OCR 无法提取的复杂架构图、流程图区域，生成 `image_placeholder`。
 
-请只返回纯 JSON 内容，确保结构完整。""",
+【输出要求】：
+仅返回包含 `elements` 数组的纯 JSON。不需要解释。""",
             },
         ]
     )
@@ -370,8 +432,7 @@ def analyze_slide_image(llm, image_base64: str, slide_index: int) -> dict:
             response_text = response_text[json_start : json_end + 1]
 
         response_text = fix_json_quotes(response_text)
-        result = json.loads(response_text)
-        return result
+        return json.loads(response_text)
 
     except Exception as e:
         print(f"JSON 解析失败: {e}")
@@ -379,7 +440,7 @@ def analyze_slide_image(llm, image_base64: str, slide_index: int) -> dict:
             "elements": [
                 {
                     "type": "text",
-                    "content": "解析失败",
+                    "content": "大模型处理 OCR 数据失败",
                     "left": "10%",
                     "top": "10%",
                     "width": "80%",
@@ -406,9 +467,17 @@ async def convert_pptx(file: UploadFile = File(...)):
         target_presentation.slide_width = Inches(13.333)
         target_presentation.slide_height = Inches(7.5)
 
-        for slide_idx, image_base64 in slide_images:
-            analysis = analyze_slide_image(llm, image_base64, slide_idx)
-            create_slide_from_analysis(target_presentation, analysis, slide_idx)
+        for slide_idx, image_base64, image_raw_bytes in slide_images:
+            # 1. 使用 EasyOCR 进行像素级坐标与文字提取
+            print(f"正在对第 {slide_idx + 1} 页进行 OCR 物理扫描...")
+            ocr_data = perform_ocr(image_raw_bytes)
+
+            # 2. 交给 Claude 进行语义组合与颜色提取
+            print(f"正在交给 LLM 进行语义排版清洗...")
+            analysis = analyze_slide_image_with_ocr(llm, image_base64, ocr_data)
+
+            # 3. 渲染
+            create_slide_from_analysis(target_presentation, analysis)
 
         output = io.BytesIO()
         target_presentation.save(output)
@@ -417,7 +486,7 @@ async def convert_pptx(file: UploadFile = File(...)):
             output,
             media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
             headers={
-                "Content-Disposition": f"attachment; filename=rebuilt_{file.filename}"
+                "Content-Disposition": f"attachment; filename=rebuilt_EasyOCR_{file.filename}"
             },
         )
     except Exception as e:
@@ -426,7 +495,7 @@ async def convert_pptx(file: UploadFile = File(...)):
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "message": "Backend is running."}
+    return {"status": "ok", "message": "Backend is running with EasyOCR Architecture."}
 
 
 if __name__ == "__main__":

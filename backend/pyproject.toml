@@ -13,4 +13,5 @@ dependencies = [
     "pydantic>=2.6.4",
     "pdf2image>=1.17.0",
     "pillow>=12.1.1",
+    "easyocr>=1.7.2",
 ]
